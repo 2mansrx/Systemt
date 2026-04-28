@@ -1,0 +1,13 @@
+pip install discord.py
+pip install psutil
+
+
+pip install pyautogui      
+pip install pyperclip     
+pip install pynput         
+
+pip install opencv-python 
+pip install sounddevice    
+pip install numpy          
+pip install scipy          
+pip install pillow
